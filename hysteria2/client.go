@@ -43,6 +43,9 @@ type ClientOptions struct {
 	SendBPS            uint64
 	ReceiveBPS         uint64
 	SalamanderPassword string
+	GeckoPassword      string
+	GeckoMinPacketSize int
+	GeckoMaxPacketSize int
 	Password           string
 	TLSConfig          aTLS.Config
 	UDPDisabled        bool
@@ -59,6 +62,9 @@ type Client struct {
 	sendBPS            uint64
 	receiveBPS         uint64
 	salamanderPassword string
+	geckoPassword      string
+	geckoMinPacketSize int
+	geckoMaxPacketSize int
 	password           string
 	tlsConfig          aTLS.Config
 	quicConfig         *quic.Config
@@ -82,6 +88,17 @@ func NewClient(options ClientOptions) (*Client, error) {
 	if len(options.TLSConfig.NextProtos()) == 0 {
 		options.TLSConfig.SetNextProtos([]string{http3.NextProtoH3})
 	}
+	if options.GeckoPassword != "" {
+		if options.GeckoMinPacketSize == 0 {
+			options.GeckoMinPacketSize = geckoDefaultMinPacketSize
+		}
+		if options.GeckoMaxPacketSize == 0 {
+			options.GeckoMaxPacketSize = geckoDefaultMaxPacketSize
+		}
+		if options.GeckoMinPacketSize <= 0 || options.GeckoMinPacketSize > options.GeckoMaxPacketSize || options.GeckoMaxPacketSize > geckoMaxOnWireSize {
+			return nil, E.New("gecko: invalid packet size range")
+		}
+	}
 	var serverPorts []uint16
 	if len(options.ServerPorts) > 0 {
 		var err error
@@ -101,6 +118,9 @@ func NewClient(options ClientOptions) (*Client, error) {
 		sendBPS:            options.SendBPS,
 		receiveBPS:         options.ReceiveBPS,
 		salamanderPassword: options.SalamanderPassword,
+		geckoPassword:      options.GeckoPassword,
+		geckoMinPacketSize: options.GeckoMinPacketSize,
+		geckoMaxPacketSize: options.GeckoMaxPacketSize,
 		password:           options.Password,
 		tlsConfig:          options.TLSConfig,
 		quicConfig:         quicConfig,
@@ -130,7 +150,9 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		}
 		var packetConn net.PacketConn
 		packetConn = bufio.NewUnbindPacketConn(udpConn)
-		if c.salamanderPassword != "" {
+		if c.geckoPassword != "" {
+			packetConn = NewGeckoConn(packetConn, []byte(c.geckoPassword), c.geckoMinPacketSize, c.geckoMaxPacketSize)
+		} else if c.salamanderPassword != "" {
 			packetConn = NewSalamanderConn(packetConn, []byte(c.salamanderPassword))
 		}
 		return packetConn, nil
