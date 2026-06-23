@@ -39,6 +39,9 @@ type ServiceOptions struct {
 	ReceiveBPS            uint64
 	IgnoreClientBandwidth bool
 	SalamanderPassword    string
+	GeckoPassword         string
+	GeckoMinPacketSize    int
+	GeckoMaxPacketSize    int
 	TLSConfig             aTLS.ServerConfig
 	UDPDisabled           bool
 	UDPTimeout            time.Duration
@@ -59,6 +62,9 @@ type Service[U comparable] struct {
 	receiveBPS            uint64
 	ignoreClientBandwidth bool
 	salamanderPassword    string
+	geckoPassword         string
+	geckoMinPacketSize    int
+	geckoMaxPacketSize    int
 	tlsConfig             aTLS.ServerConfig
 	quicConfig            *quic.Config
 	userMap               map[string]U
@@ -70,6 +76,20 @@ type Service[U comparable] struct {
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
+	if options.GeckoPassword != "" && options.SalamanderPassword != "" {
+		return nil, E.New("cannot set both GeckoPassword and SalamanderPassword")
+	}
+	if options.GeckoPassword != "" {
+		if options.GeckoMinPacketSize == 0 {
+			options.GeckoMinPacketSize = geckoDefaultMinPacketSize
+		}
+		if options.GeckoMaxPacketSize == 0 {
+			options.GeckoMaxPacketSize = geckoDefaultMaxPacketSize
+		}
+		if options.GeckoMinPacketSize <= 0 || options.GeckoMinPacketSize > options.GeckoMaxPacketSize || options.GeckoMaxPacketSize > geckoMaxOnWireSize {
+			return nil, E.New("gecko: invalid packet size range")
+		}
+	}
 	quicConfig := &quic.Config{
 		DisablePathMTUDiscovery:        !(runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin"),
 		EnableDatagrams:                !options.UDPDisabled,
@@ -96,6 +116,9 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		receiveBPS:            options.ReceiveBPS,
 		ignoreClientBandwidth: options.IgnoreClientBandwidth,
 		salamanderPassword:    options.SalamanderPassword,
+		geckoPassword:         options.GeckoPassword,
+		geckoMinPacketSize:    options.GeckoMinPacketSize,
+		geckoMaxPacketSize:    options.GeckoMaxPacketSize,
 		tlsConfig:             options.TLSConfig,
 		quicConfig:            quicConfig,
 		userMap:               make(map[string]U),
@@ -115,7 +138,9 @@ func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
-	if s.salamanderPassword != "" {
+	if s.geckoPassword != "" {
+		conn = NewGeckoConn(conn, []byte(s.geckoPassword), s.geckoMinPacketSize, s.geckoMaxPacketSize)
+	} else if s.salamanderPassword != "" {
 		conn = NewSalamanderConn(conn, []byte(s.salamanderPassword))
 	}
 	err := qtls.ConfigureHTTP3(s.tlsConfig)
