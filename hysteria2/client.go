@@ -487,7 +487,7 @@ func (c *Client) authenticateAndWrap(ctx context.Context, packetConn net.PacketC
 		Header: make(http.Header),
 	}
 	protocol.AuthRequestToHeader(request.Header, protocol.AuthRequest{Auth: c.password, Rx: c.receiveBPS})
-	handshakeTimeout := c.tlsConfig.HandshakeTimeout()
+	handshakeTimeout := qtls.ConfigHandshakeTimeout(c.tlsConfig)
 	if handshakeTimeout <= 0 {
 		handshakeTimeout = defaultHandshakeTimeout
 	}
