@@ -2,6 +2,7 @@ package hysteria2
 
 import (
 	"net"
+	"slices"
 
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"

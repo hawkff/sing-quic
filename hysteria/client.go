@@ -38,13 +38,8 @@ type ClientOptions struct {
 	XPlusPassword string
 	Password      string
 	TLSConfig     aTLS.Config
+	QUICOptions   qtls.QUICOptions
 	UDPDisabled   bool
-
-	// Legacy options
-
-	ConnReceiveWindow   uint64
-	StreamReceiveWindow uint64
-	DisableMTUDiscovery bool
 }
 
 type Client struct {
@@ -79,17 +74,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		MaxIdleTimeout:                 DefaultMaxIdleTimeout,
 		KeepAlivePeriod:                DefaultKeepAlivePeriod,
 	}
-	if options.StreamReceiveWindow != 0 {
-		quicConfig.InitialStreamReceiveWindow = options.StreamReceiveWindow
-		quicConfig.MaxStreamReceiveWindow = options.StreamReceiveWindow
-	}
-	if options.ConnReceiveWindow != 0 {
-		quicConfig.InitialConnectionReceiveWindow = options.ConnReceiveWindow
-		quicConfig.MaxConnectionReceiveWindow = options.ConnReceiveWindow
-	}
-	if options.DisableMTUDiscovery {
-		quicConfig.DisablePathMTUDiscovery = true
-	}
+	qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
 	if len(options.TLSConfig.NextProtos()) == 0 {
 		options.TLSConfig.SetNextProtos([]string{DefaultALPN})
 	}
@@ -269,7 +254,7 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	if len(c.serverPorts) == 0 {
 		packetConn, err = dialFunc(c.serverAddr)
 	} else {
-		packetConn, err = NewHopPacketConn(dialFunc, c.serverAddr, c.serverPorts, c.hopInterval)
+		packetConn, err = NewHopPacketConn(dialFunc, c.serverAddr, c.serverPorts, c.hopInterval, 0)
 	}
 	if err != nil {
 		return nil, err

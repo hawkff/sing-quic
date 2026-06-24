@@ -16,11 +16,11 @@ import (
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/quic-go/quicvarint"
 	qtls "github.com/sagernet/sing-quic"
-	congestion_meta1 "github.com/sagernet/sing-quic/congestion_meta1"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing-quic/hysteria"
 	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
 	"github.com/sagernet/sing-quic/hysteria2/internal/protocol"
+	"github.com/sagernet/sing-quic/hysteria2/realm"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -39,11 +39,17 @@ type ServiceOptions struct {
 	ReceiveBPS            uint64
 	IgnoreClientBandwidth bool
 	SalamanderPassword    string
+	GeckoPassword         string
+	GeckoMinPacketSize    int
+	GeckoMaxPacketSize    int
 	TLSConfig             aTLS.ServerConfig
+	QUICOptions           qtls.QUICOptions
 	UDPDisabled           bool
 	UDPTimeout            time.Duration
 	Handler               ServerHandler
 	MasqueradeHandler     http.Handler
+	BBRProfile            string
+	RealmOptions          *realm.Options
 }
 
 type ServerHandler interface {
@@ -59,6 +65,9 @@ type Service[U comparable] struct {
 	receiveBPS            uint64
 	ignoreClientBandwidth bool
 	salamanderPassword    string
+	geckoPassword         string
+	geckoMinPacketSize    int
+	geckoMaxPacketSize    int
 	tlsConfig             aTLS.ServerConfig
 	quicConfig            *quic.Config
 	userMap               map[string]U
@@ -67,6 +76,8 @@ type Service[U comparable] struct {
 	handler               ServerHandler
 	masqueradeHandler     http.Handler
 	quicListener          io.Closer
+	bbrProfile            congestion_meta2.Profile
+	realmServer           *realm.Server
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -82,11 +93,39 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		KeepAlivePeriod:                hysteria.DefaultKeepAlivePeriod,
 		DisablePathManager:             true,
 	}
+	qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
+	bbrProfile := congestion_meta2.ProfileStandard
+	if options.BBRProfile != "" {
+		var err error
+		bbrProfile, err = congestion_meta2.ParseProfile(options.BBRProfile)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if options.MasqueradeHandler == nil {
 		options.MasqueradeHandler = http.NotFoundHandler()
 	}
 	if len(options.TLSConfig.NextProtos()) == 0 {
 		options.TLSConfig.SetNextProtos([]string{http3.NextProtoH3})
+	}
+	if options.GeckoPassword != "" {
+		if options.GeckoMinPacketSize == 0 {
+			options.GeckoMinPacketSize = geckoDefaultMinPacketSize
+		}
+		if options.GeckoMaxPacketSize == 0 {
+			options.GeckoMaxPacketSize = geckoDefaultMaxPacketSize
+		}
+		if options.GeckoMinPacketSize <= 0 || options.GeckoMinPacketSize > options.GeckoMaxPacketSize || options.GeckoMaxPacketSize > geckoMaxOnWireSize {
+			return nil, E.New("gecko: invalid packet size range")
+		}
+	}
+	var realmServer *realm.Server
+	if options.RealmOptions != nil {
+		var err error
+		realmServer, err = realm.NewServer(*options.RealmOptions)
+		if err != nil {
+			return nil, E.Cause(err, "create realm server")
+		}
 	}
 	return &Service[U]{
 		ctx:                   options.Context,
@@ -96,6 +135,9 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		receiveBPS:            options.ReceiveBPS,
 		ignoreClientBandwidth: options.IgnoreClientBandwidth,
 		salamanderPassword:    options.SalamanderPassword,
+		geckoPassword:         options.GeckoPassword,
+		geckoMinPacketSize:    options.GeckoMinPacketSize,
+		geckoMaxPacketSize:    options.GeckoMaxPacketSize,
 		tlsConfig:             options.TLSConfig,
 		quicConfig:            quicConfig,
 		userMap:               make(map[string]U),
@@ -103,6 +145,8 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		udpTimeout:            options.UDPTimeout,
 		handler:               options.Handler,
 		masqueradeHandler:     options.MasqueradeHandler,
+		bbrProfile:            bbrProfile,
+		realmServer:           realmServer,
 	}, nil
 }
 
@@ -115,7 +159,12 @@ func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
-	if s.salamanderPassword != "" {
+	if s.realmServer != nil {
+		return s.startWithRealm(conn)
+	}
+	if s.geckoPassword != "" {
+		conn = NewGeckoConn(conn, []byte(s.geckoPassword), s.geckoMinPacketSize, s.geckoMaxPacketSize)
+	} else if s.salamanderPassword != "" {
 		conn = NewSalamanderConn(conn, []byte(s.salamanderPassword))
 	}
 	err := qtls.ConfigureHTTP3(s.tlsConfig)
@@ -131,10 +180,42 @@ func (s *Service[U]) Start(conn net.PacketConn) error {
 	return nil
 }
 
+func (s *Service[U]) startWithRealm(conn net.PacketConn) error {
+	punchConn, err := s.realmServer.Start(s.ctx, conn)
+	if err != nil {
+		return E.Cause(err, "start realm server")
+	}
+	var quicConn net.PacketConn = punchConn
+	if s.geckoPassword != "" {
+		quicConn = NewGeckoConn(quicConn, []byte(s.geckoPassword), s.geckoMinPacketSize, s.geckoMaxPacketSize)
+	} else if s.salamanderPassword != "" {
+		quicConn = NewSalamanderConn(quicConn, []byte(s.salamanderPassword))
+	}
+	err = qtls.ConfigureHTTP3(s.tlsConfig)
+	if err != nil {
+		return E.Errors(err, s.realmServer.Close())
+	}
+	listener, err := qtls.Listen(quicConn, s.tlsConfig, s.quicConfig)
+	if err != nil {
+		return E.Errors(err, s.realmServer.Close())
+	}
+	s.quicListener = listener
+	go s.loopConnections(listener)
+	return nil
+}
+
 func (s *Service[U]) Close() error {
-	return common.Close(
-		s.quicListener,
-	)
+	var realmErr error
+	if s.realmServer != nil {
+		realmErr = s.realmServer.Close()
+	}
+	return E.Errors(realmErr, common.Close(s.quicListener))
+}
+
+func (s *Service[U]) Reset() {
+	if s.realmServer != nil {
+		s.realmServer.Reset()
+	}
 }
 
 func (s *Service[U]) loopConnections(listener qtls.Listener) {
@@ -216,10 +297,10 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if timeFunc == nil {
 				timeFunc = time.Now
 			}
-			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSender(
+			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
 				congestion_meta2.DefaultClock{TimeFunc: timeFunc},
 				congestion.ByteCount(s.quicConn.Config().InitialPacketSize),
-				congestion.ByteCount(congestion_meta1.InitialCongestionWindow),
+				s.bbrProfile,
 			))
 			rxAuto = true
 		}

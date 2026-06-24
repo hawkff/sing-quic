@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"runtime"
@@ -15,11 +16,11 @@ import (
 	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	qtls "github.com/sagernet/sing-quic"
-	congestion_meta1 "github.com/sagernet/sing-quic/congestion_meta1"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing-quic/hysteria"
 	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
 	"github.com/sagernet/sing-quic/hysteria2/internal/protocol"
+	"github.com/sagernet/sing-quic/hysteria2/realm"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -30,7 +31,7 @@ import (
 	aTLS "github.com/sagernet/sing/common/tls"
 )
 
-const handshakeTimeout = 15 * time.Second
+const defaultHandshakeTimeout = 15 * time.Second
 
 type ClientOptions struct {
 	Context            context.Context
@@ -40,12 +41,19 @@ type ClientOptions struct {
 	ServerAddress      M.Socksaddr
 	ServerPorts        []string
 	HopInterval        time.Duration
+	HopIntervalMax     time.Duration
 	SendBPS            uint64
 	ReceiveBPS         uint64
 	SalamanderPassword string
+	GeckoPassword      string
+	GeckoMinPacketSize int
+	GeckoMaxPacketSize int
 	Password           string
 	TLSConfig          aTLS.Config
+	QUICOptions        qtls.QUICOptions
 	UDPDisabled        bool
+	BBRProfile         string
+	RealmOptions       *realm.Options
 }
 
 type Client struct {
@@ -56,13 +64,20 @@ type Client struct {
 	serverAddr         M.Socksaddr
 	serverPorts        []uint16
 	hopInterval        time.Duration
+	hopIntervalMax     time.Duration
 	sendBPS            uint64
 	receiveBPS         uint64
 	salamanderPassword string
+	geckoPassword      string
+	geckoMinPacketSize int
+	geckoMaxPacketSize int
 	password           string
 	tlsConfig          aTLS.Config
 	quicConfig         *quic.Config
 	udpDisabled        bool
+	bbrProfile         congestion_meta2.Profile
+	realmOptions       *realm.Options
+	controlClient      *realm.ControlClient
 
 	connAccess sync.Mutex
 	conn       *clientQUICConnection
@@ -80,8 +95,39 @@ func NewClient(options ClientOptions) (*Client, error) {
 		MaxIdleTimeout:                 hysteria.DefaultMaxIdleTimeout,
 		KeepAlivePeriod:                hysteria.DefaultKeepAlivePeriod,
 	}
+	qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
 	if len(options.TLSConfig.NextProtos()) == 0 {
 		options.TLSConfig.SetNextProtos([]string{http3.NextProtoH3})
+	}
+	bbrProfile := congestion_meta2.ProfileStandard
+	if options.BBRProfile != "" {
+		var err error
+		bbrProfile, err = congestion_meta2.ParseProfile(options.BBRProfile)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if options.RealmOptions != nil && len(options.ServerPorts) > 0 {
+		return nil, E.New("realm and port hopping are mutually exclusive")
+	}
+	if options.GeckoPassword != "" {
+		if options.GeckoMinPacketSize == 0 {
+			options.GeckoMinPacketSize = geckoDefaultMinPacketSize
+		}
+		if options.GeckoMaxPacketSize == 0 {
+			options.GeckoMaxPacketSize = geckoDefaultMaxPacketSize
+		}
+		if options.GeckoMinPacketSize <= 0 || options.GeckoMinPacketSize > options.GeckoMaxPacketSize || options.GeckoMaxPacketSize > geckoMaxOnWireSize {
+			return nil, E.New("gecko: invalid packet size range")
+		}
+	}
+	var controlClient *realm.ControlClient
+	if options.RealmOptions != nil {
+		var err error
+		controlClient, err = realm.NewControlClient(options.RealmOptions.ServerURL, options.RealmOptions.Token, options.RealmOptions.HTTPClient)
+		if err != nil {
+			return nil, E.Cause(err, "create control client")
+		}
 	}
 	var serverPorts []uint16
 	if len(options.ServerPorts) > 0 {
@@ -99,13 +145,20 @@ func NewClient(options ClientOptions) (*Client, error) {
 		serverAddr:         options.ServerAddress,
 		serverPorts:        serverPorts,
 		hopInterval:        options.HopInterval,
+		hopIntervalMax:     options.HopIntervalMax,
 		sendBPS:            options.SendBPS,
 		receiveBPS:         options.ReceiveBPS,
 		salamanderPassword: options.SalamanderPassword,
+		geckoPassword:      options.GeckoPassword,
+		geckoMinPacketSize: options.GeckoMinPacketSize,
+		geckoMaxPacketSize: options.GeckoMaxPacketSize,
 		password:           options.Password,
 		tlsConfig:          options.TLSConfig,
 		quicConfig:         quicConfig,
 		udpDisabled:        options.UDPDisabled,
+		bbrProfile:         bbrProfile,
+		realmOptions:       options.RealmOptions,
+		controlClient:      controlClient,
 	}, nil
 }
 
@@ -185,6 +238,9 @@ func (c *Client) completeOffer(pending *clientOffer, offerCtx context.Context) {
 }
 
 func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
+	if c.realmOptions != nil {
+		return c.offerNewRealm(ctx)
+	}
 	dialCtx := ctx
 	hopCtx := c.ctx
 	if hopCtx == nil {
@@ -205,7 +261,9 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		}
 		var packetConn net.PacketConn
 		packetConn = bufio.NewUnbindPacketConn(udpConn)
-		if c.salamanderPassword != "" {
+		if c.geckoPassword != "" {
+			packetConn = NewGeckoConn(packetConn, []byte(c.geckoPassword), c.geckoMinPacketSize, c.geckoMaxPacketSize)
+		} else if c.salamanderPassword != "" {
 			packetConn = NewSalamanderConn(packetConn, []byte(c.salamanderPassword))
 		}
 		return packetConn, nil
@@ -217,13 +275,204 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	if len(c.serverPorts) == 0 {
 		packetConn, err = dialFunc(c.serverAddr)
 	} else {
-		packetConn, err = hysteria.NewHopPacketConn(dialFunc, c.serverAddr, c.serverPorts, c.hopInterval)
+		packetConn, err = hysteria.NewHopPacketConn(dialFunc, c.serverAddr, c.serverPorts, c.hopInterval, c.hopIntervalMax)
 	}
 	if err != nil {
 		return nil, err
 	}
+	return c.authenticateAndWrap(ctx, packetConn, c.serverAddr)
+}
+
+type realmFamilyConn struct {
+	family         string
+	ipv4           bool
+	conn           net.PacketConn
+	localAddresses []netip.AddrPort
+}
+
+func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, error) {
+	families, err := c.realmOpenFamilies(ctx)
+	if err != nil {
+		return nil, err
+	}
+	surviving, localAddresses, err := c.realmDiscoverFamilies(ctx, families)
+	if err != nil {
+		return nil, err
+	}
+	closeSurviving := func() {
+		for _, family := range surviving {
+			_ = family.conn.Close()
+		}
+	}
+	localMetadata, err := realm.GeneratePunchMetadata()
+	if err != nil {
+		closeSurviving()
+		return nil, E.Cause(err, "generate punch metadata")
+	}
+	response, err := c.controlClient.Connect(ctx, c.realmOptions.RealmID, localAddresses, localMetadata)
+	if err != nil {
+		closeSurviving()
+		return nil, E.Cause(err, "realm connect")
+	}
+	winner, result, err := c.realmRacePunch(ctx, surviving, response.Addresses, response.PunchMetadata)
+	if err != nil {
+		return nil, err
+	}
+	packetConn := winner.conn
+	if c.geckoPassword != "" {
+		packetConn = NewGeckoConn(packetConn, []byte(c.geckoPassword), c.geckoMinPacketSize, c.geckoMaxPacketSize)
+	} else if c.salamanderPassword != "" {
+		packetConn = NewSalamanderConn(packetConn, []byte(c.salamanderPassword))
+	}
+	peerAddr := M.SocksaddrFromNetIP(result.PeerAddr)
+	return c.authenticateAndWrap(ctx, packetConn, peerAddr)
+}
+
+func (c *Client) realmOpenFamilies(ctx context.Context) ([]*realmFamilyConn, error) {
+	specs := []struct {
+		family string
+		ipv4   bool
+		addr   M.Socksaddr
+	}{
+		{"v4", true, M.SocksaddrFrom(netip.IPv4Unspecified(), 0)},
+		{"v6", false, M.SocksaddrFrom(netip.IPv6Unspecified(), 0)},
+	}
+	conns := make([]*realmFamilyConn, len(specs))
+	listenErrs := make([]error, len(specs))
+	var wg sync.WaitGroup
+	for i, spec := range specs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, listenErr := c.dialer.ListenPacket(ctx, spec.addr)
+			if listenErr != nil {
+				listenErrs[i] = E.Cause(listenErr, spec.family)
+				return
+			}
+			conns[i] = &realmFamilyConn{family: spec.family, ipv4: spec.ipv4, conn: conn}
+		}()
+	}
+	wg.Wait()
+	var families []*realmFamilyConn
+	var errs []error
+	for i, family := range conns {
+		if family != nil {
+			families = append(families, family)
+			continue
+		}
+		errs = append(errs, listenErrs[i])
+	}
+	if len(families) == 0 {
+		return nil, E.Cause(E.Errors(errs...), "listen UDP for realm")
+	}
+	return families, nil
+}
+
+func (c *Client) realmDiscoverFamilies(ctx context.Context, families []*realmFamilyConn) ([]*realmFamilyConn, []netip.AddrPort, error) {
+	var needIPv4, needIPv6 bool
+	for _, family := range families {
+		if family.ipv4 {
+			needIPv4 = true
+		} else {
+			needIPv6 = true
+		}
+	}
+	stunServers, err := realm.ResolveSTUNServers(ctx, c.realmOptions.STUNServers, c.realmOptions.Resolver, needIPv4, needIPv6)
+	if err != nil {
+		for _, family := range families {
+			_ = family.conn.Close()
+		}
+		return nil, nil, E.Cause(err, "resolve STUN servers")
+	}
+	type discoverResult struct {
+		addrs []netip.AddrPort
+		err   error
+	}
+	results := make([]discoverResult, len(families))
+	var wg sync.WaitGroup
+	for i, family := range families {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			servers := make([]netip.AddrPort, 0, len(stunServers))
+			for _, server := range stunServers {
+				if server.Addr().Is4() == family.ipv4 {
+					servers = append(servers, server)
+				}
+			}
+			addrs, discoverErr := realm.Discover(ctx, family.conn, servers)
+			results[i] = discoverResult{addrs: addrs, err: discoverErr}
+		}()
+	}
+	wg.Wait()
+	var surviving []*realmFamilyConn
+	var union []netip.AddrPort
+	var errs []error
+	for i, family := range families {
+		result := results[i]
+		if result.err != nil {
+			errs = append(errs, E.Cause(result.err, family.family))
+			_ = family.conn.Close()
+			continue
+		}
+		family.localAddresses = result.addrs
+		surviving = append(surviving, family)
+		union = append(union, result.addrs...)
+	}
+	if len(surviving) == 0 {
+		return nil, nil, E.Cause(E.Errors(errs...), "realm STUN discovery")
+	}
+	return surviving, union, nil
+}
+
+func (c *Client) realmRacePunch(
+	ctx context.Context,
+	families []*realmFamilyConn,
+	peerAddresses []netip.AddrPort,
+	metadata realm.PunchMetadata,
+) (*realmFamilyConn, realm.PunchResult, error) {
+	raceCtx, raceCancel := context.WithCancel(ctx)
+	defer raceCancel()
+	type outcome struct {
+		family *realmFamilyConn
+		result realm.PunchResult
+		err    error
+	}
+	out := make(chan outcome, len(families))
+	for _, family := range families {
+		go func() {
+			peers := make([]netip.AddrPort, 0, len(peerAddresses))
+			for _, peer := range peerAddresses {
+				if peer.Addr().Is4() == family.ipv4 {
+					peers = append(peers, peer)
+				}
+			}
+			punchResult, punchErr := realm.Punch(raceCtx, family.conn, peers, metadata)
+			out <- outcome{family: family, result: punchResult, err: punchErr}
+		}()
+	}
+	var errs []error
+	for pending := len(families); pending > 0; pending-- {
+		result := <-out
+		if result.err == nil {
+			for _, family := range families {
+				if family != result.family {
+					_ = family.conn.Close()
+				}
+			}
+			return result.family, result.result, nil
+		}
+		errs = append(errs, E.Cause(result.err, result.family.family))
+	}
+	for _, family := range families {
+		_ = family.conn.Close()
+	}
+	return nil, realm.PunchResult{}, E.Cause(E.Errors(errs...), "realm punch")
+}
+
+func (c *Client) authenticateAndWrap(ctx context.Context, packetConn net.PacketConn, peerAddr M.Socksaddr) (*clientQUICConnection, error) {
 	var quicConn *quic.Conn
-	http3Transport, err := qtls.CreateTransport(packetConn, &quicConn, c.serverAddr, c.tlsConfig, c.quicConfig)
+	http3Transport, err := qtls.CreateTransport(packetConn, &quicConn, peerAddr, c.tlsConfig, c.quicConfig)
 	if err != nil {
 		packetConn.Close()
 		return nil, err
@@ -238,9 +487,13 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		Header: make(http.Header),
 	}
 	protocol.AuthRequestToHeader(request.Header, protocol.AuthRequest{Auth: c.password, Rx: c.receiveBPS})
-	ctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
-	defer cancel()
-	response, err := http3Transport.RoundTrip(request.WithContext(ctx))
+	handshakeTimeout := qtls.ConfigHandshakeTimeout(c.tlsConfig)
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = defaultHandshakeTimeout
+	}
+	authCtx, authCancel := context.WithTimeout(ctx, handshakeTimeout)
+	defer authCancel()
+	response, err := http3Transport.RoundTrip(request.WithContext(authCtx))
 	if err != nil {
 		if quicConn != nil {
 			quicConn.CloseWithError(0, "")
@@ -268,10 +521,10 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		if timeFunc == nil {
 			timeFunc = time.Now
 		}
-		quicConn.SetCongestionControl(congestion_meta2.NewBbrSender(
+		quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
 			congestion_meta2.DefaultClock{TimeFunc: timeFunc},
 			congestion.ByteCount(quicConn.Config().InitialPacketSize),
-			congestion.ByteCount(congestion_meta1.InitialCongestionWindow),
+			c.bbrProfile,
 		))
 	}
 	conn := &clientQUICConnection{

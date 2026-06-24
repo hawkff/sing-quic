@@ -24,6 +24,7 @@ type ClientOptions struct {
 	Dialer            N.Dialer
 	ServerAddress     M.Socksaddr
 	TLSConfig         aTLS.Config
+	QUICOptions       qtls.QUICOptions
 	UUID              [16]byte
 	Password          string
 	CongestionControl string
@@ -59,6 +60,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		EnableDatagrams:         true,
 		MaxIncomingUniStreams:   1 << 60,
 	}
+	qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
 	switch options.CongestionControl {
 	case "":
 		options.CongestionControl = "cubic"

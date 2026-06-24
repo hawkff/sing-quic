@@ -166,7 +166,7 @@ func (c *udpPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	case pkt := <-c.data:
 		n = copy(p, pkt.data.Bytes())
 		destination := M.ParseSocksaddrHostPort(pkt.host, pkt.port).Unwrap()
-		if destination.IsFqdn() {
+		if destination.IsDomain() {
 			addr = destination
 		} else {
 			addr = destination.UDPAddr()

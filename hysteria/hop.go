@@ -11,6 +11,7 @@ import (
 
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -25,6 +26,7 @@ type HopPacketConn struct {
 	destination     M.Socksaddr
 	ports           []uint16
 	interval        time.Duration
+	intervalMax     time.Duration
 	access          sync.Mutex
 	prevConn        net.PacketConn
 	currentConn     net.PacketConn
@@ -42,15 +44,27 @@ func NewHopPacketConn(
 	destination M.Socksaddr,
 	ports []uint16,
 	interval time.Duration,
+	intervalMax time.Duration,
 ) (*HopPacketConn, error) {
-	if interval == 0 {
+	if interval == 0 && intervalMax == 0 {
 		interval = defaultHopInterval
+		intervalMax = defaultHopInterval
+	} else if intervalMax == 0 {
+		intervalMax = interval
+	} else if interval == 0 {
+		return nil, E.New("min and max hop interval must both be set")
+	} else if interval > intervalMax {
+		return nil, E.New("min hop interval must not be greater than max hop interval")
+	}
+	if interval < 5*time.Second {
+		return nil, E.New("hop interval must be at least 5 seconds")
 	}
 	hopConn := &HopPacketConn{
 		dialFunc:    dialFunc,
 		destination: destination,
 		ports:       ports,
 		interval:    interval,
+		intervalMax: intervalMax,
 		packetChan:  make(chan *buf.Buffer, packetQueueSize),
 		errChan:     make(chan error, 1),
 		doneChan:    make(chan struct{}),
@@ -98,13 +112,21 @@ func (c *HopPacketConn) recvLoop(conn net.PacketConn) {
 	}
 }
 
+func (c *HopPacketConn) nextHopInterval() time.Duration {
+	if c.interval == c.intervalMax {
+		return c.interval
+	}
+	return c.interval + time.Duration(rand.Int63n(int64(c.intervalMax-c.interval)+1))
+}
+
 func (c *HopPacketConn) hopLoop() {
-	ticker := time.NewTicker(c.interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(c.nextHopInterval())
+	defer timer.Stop()
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			c.hop()
+			timer.Reset(c.nextHopInterval())
 		case <-c.doneChan:
 			return
 		}
