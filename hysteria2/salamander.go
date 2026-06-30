@@ -11,7 +11,6 @@ import (
 	N "github.com/sagernet/sing/common/network"
 
 	"golang.org/x/crypto/blake2b"
-	"golang.org/x/exp/slices"
 )
 
 const salamanderSaltLen = 8
